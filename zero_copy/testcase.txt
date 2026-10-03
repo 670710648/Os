@@ -1,0 +1,389 @@
+=====================================================================
+ TEST CASES  (10 cases)  -  Multi-threaded File Download
+ ชุดทดสอบ 10 กรณี  -  Client/Server ดาวน์โหลดไฟล์แบบหลาย thread
+=====================================================================
+
+All "Actual output" blocks below are REAL output captured from running
+the program (not typed by hand). Your numbers for time, MB/s and the
+ORDER of the worker lines will be different on your machine: that is
+normal. What must be the same is listed under "Expected result".
+
+Extra automatic check: "java TestRunner" runs 72 more checks
+(see HOW_TO_RUN.txt). These 10 cases are the ones you run by hand and
+can show in your report / demo.
+
+
+PREPARATION (do once)
+---------------------------------------------------------------------
+1. Compile (in the project folder):
+       javac *.java
+2. Create the 100 MB test file (same content on every computer):
+       java MakeTestFile shared/test.bin 100
+   Its SHA-256 must always be:
+       be09bb617fc7866b59acce2bd709eef846ed928edf541c30279f96e611e23584
+   To check it yourself:
+       Windows (cmd)        : certutil -hashfile shared\test.bin SHA256
+       Windows (PowerShell) : Get-FileHash shared\test.bin -Algorithm SHA256
+       Linux / macOS        : sha256sum shared/test.bin
+3. The folder "shared" must contain these 3 files:
+       hello.txt        44 bytes         (provided)
+       sample_odd.bin   1000003 bytes    (provided, size NOT divisible by 10)
+       test.bin         104857600 bytes  (created in step 2)
+4. Start the server in Terminal 1 and leave it open:
+       java Server
+   You should see:  [server] listening on port 5000, sharing folder: ...
+5. Open Terminal 2 (same folder) and run the test cases below in order.
+
+Range rule used by the client (to predict the expected output):
+    chunk = size / workers ; worker i starts at i * chunk ;
+    the LAST worker takes the remainder (size - its offset).
+
+Summary
+---------------------------------------------------------------------
+ TC01  LIST files
+ TC02  INFO of an existing file
+ TC03  INFO of a missing file (error handling)
+ TC04  Download, 1 worker,  Traditional I/O
+ TC05  Download, 10 workers, Traditional I/O
+ TC06  Download, 1 worker,  NIO native transfer
+ TC07  Download, 10 workers, NIO native transfer
+ TC08  Tiny file (44 bytes) with 10 workers   (split of a small file)
+ TC09  Odd-size file (1000003 bytes), 10 workers, NIO (last worker remainder)
+ TC10  Benchmark: io/nio x 1/10 workers x 3 runs
+
+---------------------------------------------------------------------
+TC01  LIST files
+---------------------------------------------------------------------
+Purpose / จุดประสงค์ :
+    Client asks the server for the list of downloadable files.
+    ขอรายชื่อไฟล์ทั้งหมดที่ server แชร์
+
+Command (Terminal 2, server must be running):
+    java Client localhost 5000 list
+
+Expected result (pass criteria):
+    - One line "FILE <name> <size>" for every file in shared/
+    - Sizes: hello.txt 44, sample_odd.bin 1000003, test.bin 104857600
+    - Exit code 0
+
+Actual output (sample run, exit code 0):
+    FILE hello.txt 44
+    FILE sample_odd.bin 1000003
+    FILE test.bin 104857600
+
+Result in sample run : PASS
+Your result          : [ ] PASS   [ ] FAIL     Notes: ____________________
+
+---------------------------------------------------------------------
+TC02  INFO of an existing file
+---------------------------------------------------------------------
+Purpose / จุดประสงค์ :
+    Client asks for the size of one file before downloading.
+    ขอขนาดไฟล์ก่อนเริ่มดาวน์โหลด
+
+Command (Terminal 2, server must be running):
+    java Client localhost 5000 info test.bin
+
+Expected result (pass criteria):
+    - Prints the file name and size: 104857600 bytes
+    - Exit code 0
+
+Actual output (sample run, exit code 0):
+    test.bin : 104857600 bytes
+
+Result in sample run : PASS
+Your result          : [ ] PASS   [ ] FAIL     Notes: ____________________
+
+---------------------------------------------------------------------
+TC03  INFO of a missing file (error handling)
+---------------------------------------------------------------------
+Purpose / จุดประสงค์ :
+    Server must answer ERROR 404 for a file that does not exist; the client must report it and stop (no crash, no hang).
+    ขอไฟล์ที่ไม่มี ต้องได้ ERROR 404 และโปรแกรมไม่ค้าง
+
+Command (Terminal 2, server must be running):
+    java Client localhost 5000 info nope.bin
+
+Expected result (pass criteria):
+    - Message contains "ERROR 404 File not found"
+    - Exit code 1 (error)
+
+Actual output (sample run, exit code 1):
+    Error: Server replied: ERROR 404 File not found
+
+Result in sample run : PASS
+Your result          : [ ] PASS   [ ] FAIL     Notes: ____________________
+
+---------------------------------------------------------------------
+TC04  Download, 1 worker, Traditional I/O
+---------------------------------------------------------------------
+Purpose / จุดประสงค์ :
+    Baseline: whole file in one range with read/write loops.
+    ดาวน์โหลดด้วย worker เดียว แบบ Traditional I/O (ค่าอ้างอิง)
+
+Command (Terminal 2, server must be running):
+    java Client localhost 5000 download test.bin out.bin 1 io
+    Optional independent check of the result:
+       Windows: certutil -hashfile out.bin SHA256
+       Linux  : sha256sum out.bin
+
+Expected result (pass criteria):
+    - Exactly 1 worker line: offset=0 length=104857600
+    - "size+SHA-256 check: OK"
+    - Exit code 0
+
+Actual output (sample run, exit code 0):
+      worker  0  offset=0            length=104857600    170 ms
+    Done: 104857600 bytes in 0.210 s = 476.7 MB/s, size+SHA-256 check: OK
+Independent SHA-256 of out.bin (must equal the test.bin hash):
+    be09bb617fc7866b59acce2bd709eef846ed928edf541c30279f96e611e23584
+
+Result in sample run : PASS
+Your result          : [ ] PASS   [ ] FAIL     Notes: ____________________
+
+---------------------------------------------------------------------
+TC05  Download, 10 workers, Traditional I/O
+---------------------------------------------------------------------
+Purpose / จุดประสงค์ :
+    10 workers, each with its own connection and byte range.
+    ดาวน์โหลดด้วย 10 workers พร้อมกัน แบบ Traditional I/O
+
+Command (Terminal 2, server must be running):
+    java Client localhost 5000 download test.bin out.bin 10 io
+
+Expected result (pass criteria):
+    - Exactly 10 worker lines, in any order, with these ranges
+      (every length 10485760, no overlap, no gap):
+      worker 0: offset=0          length=10485760
+      worker 1: offset=10485760   length=10485760
+      worker 2: offset=20971520   length=10485760
+      worker 3: offset=31457280   length=10485760
+      worker 4: offset=41943040   length=10485760
+      worker 5: offset=52428800   length=10485760
+      worker 6: offset=62914560   length=10485760
+      worker 7: offset=73400320   length=10485760
+      worker 8: offset=83886080   length=10485760
+      worker 9: offset=94371840   length=10485760
+    - "size+SHA-256 check: OK"
+    - Exit code 0
+
+Actual output (sample run, exit code 0):
+      worker  4  offset=41943040     length=10485760     77 ms
+      worker  3  offset=31457280     length=10485760     96 ms
+      worker  5  offset=52428800     length=10485760     96 ms
+      worker  2  offset=20971520     length=10485760     121 ms
+      worker  1  offset=10485760     length=10485760     141 ms
+      worker  0  offset=0            length=10485760     162 ms
+      worker  6  offset=62914560     length=10485760     146 ms
+      worker  8  offset=83886080     length=10485760     146 ms
+      worker  7  offset=73400320     length=10485760     151 ms
+      worker  9  offset=94371840     length=10485760     150 ms
+    Done: 104857600 bytes in 0.179 s = 559.0 MB/s, size+SHA-256 check: OK
+Independent SHA-256 of out.bin:
+    be09bb617fc7866b59acce2bd709eef846ed928edf541c30279f96e611e23584
+
+Result in sample run : PASS
+Your result          : [ ] PASS   [ ] FAIL     Notes: ____________________
+
+---------------------------------------------------------------------
+TC06  Download, 1 worker, NIO native transfer
+---------------------------------------------------------------------
+Purpose / จุดประสงค์ :
+    Same as TC04 but using FileChannel.transferTo (server) and transferFrom (client).
+    ดาวน์โหลดด้วย worker เดียว แบบ NIO (transferTo / transferFrom)
+
+Command (Terminal 2, server must be running):
+    java Client localhost 5000 download test.bin out.bin 1 nio
+
+Expected result (pass criteria):
+    - Exactly 1 worker line: offset=0 length=104857600
+    - "size+SHA-256 check: OK"
+    - Exit code 0
+
+Actual output (sample run, exit code 0):
+      worker  0  offset=0            length=104857600    281 ms
+    Done: 104857600 bytes in 0.313 s = 320.0 MB/s, size+SHA-256 check: OK
+Independent SHA-256 of out.bin:
+    be09bb617fc7866b59acce2bd709eef846ed928edf541c30279f96e611e23584
+
+Result in sample run : PASS
+Your result          : [ ] PASS   [ ] FAIL     Notes: ____________________
+
+---------------------------------------------------------------------
+TC07  Download, 10 workers, NIO native transfer
+---------------------------------------------------------------------
+Purpose / จุดประสงค์ :
+    Same as TC05 but using the NIO native path.
+    ดาวน์โหลดด้วย 10 workers แบบ NIO
+
+Command (Terminal 2, server must be running):
+    java Client localhost 5000 download test.bin out.bin 10 nio
+
+Expected result (pass criteria):
+    - Exactly 10 worker lines, same ranges as TC05
+      worker 0: offset=0          length=10485760
+      worker 1: offset=10485760   length=10485760
+      worker 2: offset=20971520   length=10485760
+      worker 3: offset=31457280   length=10485760
+      worker 4: offset=41943040   length=10485760
+      worker 5: offset=52428800   length=10485760
+      worker 6: offset=62914560   length=10485760
+      worker 7: offset=73400320   length=10485760
+      worker 8: offset=83886080   length=10485760
+      worker 9: offset=94371840   length=10485760
+    - "size+SHA-256 check: OK"
+    - Exit code 0
+
+Actual output (sample run, exit code 0):
+      worker  6  offset=62914560     length=10485760     191 ms
+      worker  0  offset=0            length=10485760     208 ms
+      worker  5  offset=52428800     length=10485760     200 ms
+      worker  3  offset=31457280     length=10485760     213 ms
+      worker  4  offset=41943040     length=10485760     235 ms
+      worker  2  offset=20971520     length=10485760     235 ms
+      worker  9  offset=94371840     length=10485760     229 ms
+      worker  7  offset=73400320     length=10485760     234 ms
+      worker  8  offset=83886080     length=10485760     232 ms
+      worker  1  offset=10485760     length=10485760     251 ms
+    Done: 104857600 bytes in 0.265 s = 377.3 MB/s, size+SHA-256 check: OK
+Independent SHA-256 of out.bin:
+    be09bb617fc7866b59acce2bd709eef846ed928edf541c30279f96e611e23584
+
+Result in sample run : PASS
+Your result          : [ ] PASS   [ ] FAIL     Notes: ____________________
+
+---------------------------------------------------------------------
+TC08  Tiny file (44 bytes) with 10 workers
+---------------------------------------------------------------------
+Purpose / จุดประสงค์ :
+    File is much smaller than a normal chunk: 44 / 10 = 4 bytes per worker, and the last worker takes the remainder (8 bytes).
+    ไฟล์เล็กมาก (44 byte) ใช้ 10 workers ทดสอบการแบ่งช่วงเมื่อไฟล์เล็ก
+
+Command (Terminal 2, server must be running):
+    java Client localhost 5000 download hello.txt out_hello.txt 10 io
+
+Expected result (pass criteria):
+    - Workers 0-8: length=4 at offsets 0,4,8,...,32
+    - Worker 9: offset=36 length=8   (4 + remainder 4)
+    - "size+SHA-256 check: OK"
+    - The content of out_hello.txt is the same as hello.txt
+      (Windows: type out_hello.txt   Linux/macOS: cat out_hello.txt)
+    - Exit code 0
+
+Actual output (sample run, exit code 0):
+      worker  1  offset=4            length=4            18 ms
+      worker  2  offset=8            length=4            28 ms
+      worker  7  offset=28           length=4            23 ms
+      worker  4  offset=16           length=4            29 ms
+      worker  0  offset=0            length=4            34 ms
+      worker  6  offset=24           length=4            29 ms
+      worker  3  offset=12           length=4            34 ms
+      worker  5  offset=20           length=4            36 ms
+      worker  9  offset=36           length=8            31 ms
+      worker  8  offset=32           length=4            45 ms
+    Done: 44 bytes in 0.065 s = 0.0 MB/s, size+SHA-256 check: OK
+Content of out_hello.txt:
+    Hello from the shared folder! (sample file)
+SHA-256 of out_hello.txt (equals hello.txt):
+    3ccca89ac63e1f0294ed14490efdaeeba4ade11bef4882afc8069b9c8e91e36a
+
+Result in sample run : PASS
+Your result          : [ ] PASS   [ ] FAIL     Notes: ____________________
+
+---------------------------------------------------------------------
+TC09  Odd-size file (1000003 bytes), 10 workers, NIO
+---------------------------------------------------------------------
+Purpose / จุดประสงค์ :
+    1000003 is not divisible by 10: workers 0-8 get 100000 bytes, the last worker gets 100003.
+    ไฟล์ขนาดหาร 10 ไม่ลงตัว worker ตัวสุดท้ายต้องรับส่วนที่เหลือ
+
+Command (Terminal 2, server must be running):
+    java Client localhost 5000 download sample_odd.bin out_odd.bin 10 nio
+
+Expected result (pass criteria):
+    - Workers 0-8: length=100000 at offsets 0,100000,...,800000
+    - Worker 9: offset=900000 length=100003
+    - "size+SHA-256 check: OK"
+    - Exit code 0
+
+Actual output (sample run, exit code 0):
+      worker  3  offset=300000       length=100000       13 ms
+      worker  4  offset=400000       length=100000       17 ms
+      worker  2  offset=200000       length=100000       34 ms
+      worker  1  offset=100000       length=100000       35 ms
+      worker  6  offset=600000       length=100000       14 ms
+      worker  5  offset=500000       length=100000       17 ms
+      worker  0  offset=0            length=100000       40 ms
+      worker  7  offset=700000       length=100000       14 ms
+      worker  8  offset=800000       length=100000       19 ms
+      worker  9  offset=900000       length=100003       19 ms
+    Done: 1000003 bytes in 0.064 s = 15.0 MB/s, size+SHA-256 check: OK
+SHA-256 of out_odd.bin (equals sample_odd.bin):
+    8abc78c7b2e81d7a5da73d2c151a7f377ad90392c45cf1287076d5063fc663a3
+
+Result in sample run : PASS
+Your result          : [ ] PASS   [ ] FAIL     Notes: ____________________
+
+---------------------------------------------------------------------
+TC10  Benchmark: io/nio x 1/10 workers x 3 runs
+---------------------------------------------------------------------
+Purpose / จุดประสงค์ :
+    Runs the full experiment of the assignment automatically (1 warm-up run that is not counted, then 3 runs of each case) and verifies every download.
+    รันการทดลองครบทุกกรณี และตรวจไฟล์ทุกรอบ
+
+Command (Terminal 2, server must be running):
+    java Client localhost 5000 benchmark test.bin 3
+
+Expected result (pass criteria):
+    - 12 result rows: io/1, io/10, nio/1, nio/10, 3 runs each
+    - Column "verified" is OK in EVERY row (any MISMATCH = test failed)
+    - An "Average over 3 runs" block with 4 lines
+    - Exit code 0
+    - The time and MB/s values depend on the machine; they are NOT
+      pass/fail criteria. (Do not copy these numbers into your report:
+      use your own results.)
+
+Actual output (sample run, exit code 0):
+    Warm-up run (not counted) ...
+
+    mode   workers  run  time(s)    MB/s       verified 
+    io     1        1    0.105      954.5      OK       
+    io     1        2    0.080      1251.2     OK       
+    io     1        3    0.114      878.1      OK       
+    io     10       1    0.088      1130.3     OK       
+    io     10       2    0.089      1117.9     OK       
+    io     10       3    0.086      1169.1     OK       
+    nio    1        1    0.205      488.5      OK       
+    nio    1        2    0.108      928.5      OK       
+    nio    1        3    0.107      933.1      OK       
+    nio    10       1    0.127      790.2      OK       
+    nio    10       2    0.117      852.3      OK       
+    nio    10       3    0.102      982.3      OK       
+
+    === Average over 3 runs ===
+    io     1        avg time = 0.100 s   avg speed = 1027.9 MB/s
+    io     10       avg time = 0.088 s   avg speed = 1139.1 MB/s
+    nio    1        avg time = 0.140 s   avg speed = 783.4 MB/s
+    nio    10       avg time = 0.115 s   avg speed = 874.9 MB/s
+
+Result in sample run : PASS
+Your result          : [ ] PASS   [ ] FAIL     Notes: ____________________
+
+=====================================================================
+ SUMMARY TABLE (fill in on your machine)
+=====================================================================
+ TC   Test                                       Sample run   Your result
+ ---  -----------------------------------------  -----------  -----------
+ 01   LIST files                                 PASS         [ ]
+ 02   INFO existing file                         PASS         [ ]
+ 03   INFO missing file -> ERROR 404             PASS         [ ]
+ 04   Download 1 worker, io                      PASS         [ ]
+ 05   Download 10 workers, io                    PASS         [ ]
+ 06   Download 1 worker, nio                     PASS         [ ]
+ 07   Download 10 workers, nio                   PASS         [ ]
+ 08   Tiny file 44 B, 10 workers                 PASS         [ ]
+ 09   Odd size 1000003 B, 10 workers, nio        PASS         [ ]
+ 10   Benchmark (12 runs, all verified)          PASS         [ ]
+
+ Cleanup: delete out.bin, out_hello.txt, out_odd.bin and shared/test.bin
+ when you finish (benchmark_download.tmp is deleted automatically).
