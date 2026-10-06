@@ -10,6 +10,7 @@ jobs_single.csv: Single-job graceful-shutdown edge case
 Required experiment commands
 -- chcp 65001 -- ภาษาไทย print ไม่ออก
 -- java Main workloads/jobs_standard.csv priority 3 1 2 --
+-- chcp 65001 ; java Main workloads/jobs_printer.csv priority 3 2 2  > logs\printer_prio322.log --
 java Main jobs_standard.csv fcfs 3 1 2
 java Main jobs_standard.csv priority 3 1 2
 java Main jobs_standard.csv priority 1 1 2
