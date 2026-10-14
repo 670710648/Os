@@ -1,52 +1,79 @@
+import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.net.StandardSocketOptions;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 /**
- * Multi-threaded file download SERVER - entry point.
- * This class only accepts connections; ClientHandler talks to each client
- * and FileSender moves the file bytes.
+ * The SERVER: main program.
+ * It only waits for clients. For every client that connects, it creates a new thread
+ * (a ClientHandler) that talks to that client, so many clients are served at the same time.
  *
- * Run:  java Server [port] [directory]      (defaults: 5000, ./shared)
+ * Run:  java Server [port] [folder]        (default: port 5000, folder "shared")
  */
 public class Server {
 
     public static void main(String[] args) throws IOException {
-        int port = args.length > 0 ? Integer.parseInt(args[0]) : Protocol.DEFAULT_PORT;
-        Path dir = Path.of(args.length > 1 ? args[1] : "shared").toAbsolutePath().normalize();
-        if (!Files.isDirectory(dir)) {
-            System.err.println("Directory not found: " + dir);
+        // 1) read the settings from the command line (or use the defaults)
+        int port = Protocol.DEFAULT_PORT;
+        String folderName = "shared";
+        if (args.length > 0) {
+            try {
+                port = Integer.parseInt(args[0]);
+            } catch (NumberFormatException e) {
+                System.err.println("The port must be a number, for example 5000 (not \""
+                        + args[0] + "\")");
+                System.exit(1);
+            }
+        }
+        if (port < 1 || port > 65535) {
+            System.err.println("The port must be between 1 and 65535 (not " + port + ")");
             System.exit(1);
         }
+        if (args.length > 1) {
+            folderName = args[1];
+        }
 
-        // A cached pool creates one thread per active connection, so many clients
-        // (10 workers each) are served at the same time.
-        // On Java 21 you can use virtual threads instead:
-        //   ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor();
-        ExecutorService pool = Executors.newCachedThreadPool();
+        File folder = new File(folderName).getCanonicalFile();
+        if (!folder.isDirectory()) {
+            System.err.println("Directory not found: " + folder);
+            System.exit(1);                      // exit code 1 = error (so a script can notice)
+        }
 
-        // SHA-256 results are cached so a big file is not re-hashed on every HASH request
-        Map<String, String> hashCache = new ConcurrentHashMap<>();
-
-        try (ServerSocketChannel serverChannel = ServerSocketChannel.open()) {
-            serverChannel.setOption(StandardSocketOptions.SO_REUSEADDR, true);
+        // 2) open the port
+        ServerSocketChannel serverChannel = ServerSocketChannel.open();
+        try {
             serverChannel.bind(new InetSocketAddress(port));
-            System.out.println("[server] listening on port " + port + ", sharing folder: " + dir);
+        } catch (IOException e) {
+            System.err.println("Cannot open port " + port + ": " + e.getMessage()
+                    + "   (is another server already running on this port?)");
+            System.exit(1);
+        }
+        System.out.println("[server] listening on port " + port + ", sharing folder: " + folder);
 
-            while (true) {
-                SocketChannel client = serverChannel.accept();   // blocks until a client connects
-                pool.submit(new ClientHandler(client, dir, hashCache));
+        // 3) loop forever: accept a client, give it its own thread
+        while (true) {
+            SocketChannel client = null;
+            try {
+                client = serverChannel.accept();             // waits here until a client connects
+            } catch (IOException e) {
+                // For example "Too many open files". One failed accept must not stop the
+                // whole server: we write a message, wait a moment and try again.
+                System.out.println("[server] accept failed: " + e.getMessage());
+                pause(100);
+                continue;
             }
-        } finally {
-            pool.shutdown();
+            ClientHandler handler = new ClientHandler(client, folder);
+            Thread thread = new Thread(handler);
+            thread.start();                                  // handler.run() now runs in parallel
+        }
+    }
+
+    private static void pause(int milliseconds) {
+        try {
+            Thread.sleep(milliseconds);
+        } catch (InterruptedException e) {
+            // nothing to do
         }
     }
 }

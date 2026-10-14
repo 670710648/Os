@@ -1,121 +1,145 @@
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.SocketTimeoutException;
 import java.nio.channels.SocketChannel;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.stream.Stream;
+import java.util.Arrays;
+import java.util.Locale;
+import java.util.regex.Pattern;
 
 /**
- * Runs in its own thread, one per connection. Reads commands from one client
- * (LIST / INFO / HASH / GET) and answers them, until the client disconnects.
+ * Talks to ONE client. The Server creates one ClientHandler (and one thread) per connection.
+ * It reads commands (LIST / INFO / HASH / GET) and sends the answers,
+ * until the client closes the connection.
  */
 public class ClientHandler implements Runnable {
 
-    private final SocketChannel channel;
-    private final Path baseDir;
-    private final Map<String, String> hashCache;
+    // If a client sends nothing for this long (in milliseconds), the server closes the
+    // connection. Without it, a client that connects and then does nothing would keep one
+    // server thread alive for ever. (It is not "final" only so that TestRunner can make it short.)
+    static int idleTimeoutMs = 60000;
 
-    public ClientHandler(SocketChannel channel, Path baseDir, Map<String, String> hashCache) {
+    private SocketChannel channel;    // the connection to this client
+    private File folder;              // the folder that is shared
+    private InputStream in;           // used to read what the client sends
+    private OutputStream out;         // used to send answers to the client
+
+    public ClientHandler(SocketChannel channel, File folder) {
         this.channel = channel;
-        this.baseDir = baseDir;
-        this.hashCache = hashCache;
+        this.folder = folder;
     }
 
-    @Override
+    // This method runs inside the new thread (started by Server).
     public void run() {
-        String who = String.valueOf(channel.socket().getRemoteSocketAddress());
-        try (channel) {
-            InputStream in = channel.socket().getInputStream();
-            OutputStream out = channel.socket().getOutputStream();
+        try {
+            in = channel.socket().getInputStream();
+            out = channel.socket().getOutputStream();
+            channel.socket().setSoTimeout(idleTimeoutMs);    // only affects READING commands
 
-            String line;
-            while ((line = Protocol.readLine(in)) != null) {
-                String[] parts = line.trim().split("\\s+");
-                String cmd = parts[0].toUpperCase();
+            while (true) {
+                String line = Protocol.readLine(in);
+                if (line == null) {
+                    break;                       // the client closed the connection
+                }
+                handleCommand(line);
+            }
+        } catch (SocketTimeoutException e) {
+            System.out.println("[server] closing a connection that was idle for too long");
+        } catch (IOException e) {
+            // normal when a client disconnects in the middle of a transfer
+            System.out.println("[server] connection ended: " + e.getMessage());
+        } finally {
+            try {
+                channel.close();                 // always close the connection at the end
+            } catch (IOException e) {
+                // nothing more we can do
+            }
+        }
+    }
 
-                if (cmd.equals("LIST")) {
-                    handleList(out);
-                } else if (cmd.equals("INFO")) {
-                    handleInfo(parts, out);
-                } else if (cmd.equals("HASH")) {
-                    handleHash(parts, out);
-                } else if (cmd.equals("GET")) {
-                    handleGet(parts, out);
-                } else {
-                    Protocol.sendLine(out, "ERROR 400 Unknown command");
+    // Look at the first word of the line and call the right method.
+    private void handleCommand(String line) throws IOException {
+        String[] parts = line.split("\\s+");     // split on spaces, e.g. "GET a.bin 0 10"
+        // Locale.ROOT = always the English rules. (With the Turkish rules "info".toUpperCase()
+        // would give "İNFO", and the command would not be recognised.)
+        String command = parts[0].toUpperCase(Locale.ROOT);
+
+        if (command.equals("LIST")) {
+            handleList();
+        } else if (command.equals("INFO")) {
+            handleInfo(parts);
+        } else if (command.equals("HASH")) {
+            handleHash(parts);
+        } else if (command.equals("GET")) {
+            handleGet(parts);
+        } else {
+            Protocol.sendLine(out, "ERROR 400 Unknown command");
+        }
+    }
+
+    // LIST  ->  FILE <name> <size> ... and then END
+    // Only files that a client can really ask for are listed (see isAllowedName).
+    private void handleList() throws IOException {
+        File[] files = folder.listFiles();
+        if (files != null) {
+            Arrays.sort(files);
+            for (File f : files) {
+                if (f.isFile() && isAllowedName(f.getName())) {
+                    Protocol.sendLine(out, "FILE " + f.getName() + " " + f.length());
                 }
             }
-        } catch (IOException e) {
-            // Normal when a client disconnects in the middle of a transfer.
-            log(who + " connection ended: " + e.getMessage());
-        }
-    }
-
-    // LIST -> FILE <name> <size> ... END
-    private void handleList(OutputStream out) throws IOException {
-        List<Path> files = new ArrayList<>();
-        try (Stream<Path> s = Files.list(baseDir)) {
-            s.filter(Files::isRegularFile).forEach(files::add);
-        }
-        Collections.sort(files);
-        for (Path f : files) {
-            Protocol.sendLine(out, "FILE " + f.getFileName() + " " + Files.size(f));
         }
         Protocol.sendLine(out, "END");
     }
 
-    // INFO <filename> -> SIZE <bytes>
-    private void handleInfo(String[] parts, OutputStream out) throws IOException {
+    // INFO <filename>  ->  SIZE <bytes>
+    private void handleInfo(String[] parts) throws IOException {
         if (parts.length != 2) {
-            Protocol.sendLine(out, "ERROR 400 Usage: INFO <filename>");
+            Protocol.sendLine(out, "ERROR 400 Usage: INFO <filename>"
+                    + "   (the file name cannot contain spaces)");
             return;
         }
-        Path file = resolveFile(parts[1]);
+        File file = findFile(parts[1]);
         if (file == null) {
             Protocol.sendLine(out, "ERROR 404 File not found");
             return;
         }
-        Protocol.sendLine(out, "SIZE " + Files.size(file));
+        Protocol.sendLine(out, "SIZE " + file.length());
     }
 
-    // HASH <filename> -> SHA256 <hex>   (lets the client verify its download)
-    private void handleHash(String[] parts, OutputStream out) throws IOException {
+    // HASH <filename>  ->  SHA256 <hex>   (the client uses it to check its download)
+    private void handleHash(String[] parts) throws IOException {
         if (parts.length != 2) {
-            Protocol.sendLine(out, "ERROR 400 Usage: HASH <filename>");
+            Protocol.sendLine(out, "ERROR 400 Usage: HASH <filename>"
+                    + "   (the file name cannot contain spaces)");
             return;
         }
-        Path file = resolveFile(parts[1]);
+        File file = findFile(parts[1]);
         if (file == null) {
             Protocol.sendLine(out, "ERROR 404 File not found");
             return;
         }
-        String key = file + "|" + Files.size(file) + "|" + Files.getLastModifiedTime(file);
-        String hash = hashCache.get(key);
-        if (hash == null) {
-            hash = FileUtil.sha256(file);
-            hashCache.put(key, hash);
-        }
-        Protocol.sendLine(out, "SHA256 " + hash);
+        Protocol.sendLine(out, "SHA256 " + FileUtil.sha256(file));
     }
 
-    // GET <filename> <offset> <length> [io|nio]
-    private void handleGet(String[] parts, OutputStream out) throws IOException {
+    // GET <filename> <offset> <length> [io|nio]  ->  OK <length> and then the raw bytes
+    private void handleGet(String[] parts) throws IOException {
+        // check the number of words
         if (parts.length != 4 && parts.length != 5) {
-            Protocol.sendLine(out, "ERROR 400 Usage: GET <filename> <offset> <length> [io|nio]");
+            Protocol.sendLine(out, "ERROR 400 Usage: GET <filename> <offset> <length> [io|nio]"
+                    + "   (the file name cannot contain spaces)");
             return;
         }
 
-        Path file = resolveFile(parts[1]);
+        // check the file
+        File file = findFile(parts[1]);
         if (file == null) {
             Protocol.sendLine(out, "ERROR 404 File not found");
             return;
         }
 
+        // check that offset and length are numbers
         long offset;
         long length;
         try {
@@ -126,42 +150,60 @@ public class ClientHandler implements Runnable {
             return;
         }
 
-        String mode = parts.length == 5 ? parts[4].toLowerCase() : Protocol.MODE_IO;
+        // check the mode (io is the default)
+        String mode = Protocol.MODE_IO;
+        if (parts.length == 5) {
+            mode = parts[4].toLowerCase(Locale.ROOT);
+        }
         if (!mode.equals(Protocol.MODE_IO) && !mode.equals(Protocol.MODE_NIO)) {
             Protocol.sendLine(out, "ERROR 400 Mode must be io or nio");
             return;
         }
 
-        long size = Files.size(file);
-        // "length > size - offset" is written this way to avoid overflow of offset + length
+        // check that the range is inside the file
+        // (we write "length > size - offset" instead of "offset + length > size"
+        //  because offset + length could overflow when the numbers are huge)
+        long size = file.length();
         if (offset < 0 || length < 0 || offset > size || length > size - offset) {
             Protocol.sendLine(out, "ERROR 416 Range out of bounds (file size is " + size + ")");
             return;
         }
 
-        // Header first, then exactly <length> bytes of payload.
+        // everything is fine: first the header line, then exactly <length> bytes
         Protocol.sendLine(out, "OK " + length);
         if (mode.equals(Protocol.MODE_NIO)) {
             FileSender.sendWithNio(file, offset, length, channel);
         } else {
             FileSender.sendWithStreams(file, offset, length, out);
         }
-        log("GET " + file.getFileName() + " offset=" + offset + " length=" + length + " mode=" + mode);
+        System.out.println("[server] GET " + file.getName() + " offset=" + offset
+                + " length=" + length + " mode=" + mode);
     }
 
-    // Only allow plain file names inside the shared folder (blocks ../ tricks).
-    private Path resolveFile(String name) {
-        if (name.contains("/") || name.contains("\\") || name.contains("..")) {
-            return null;
+    // Is this file name allowed? The same rule is used by LIST and by findFile,
+    // so LIST never shows a file that the client cannot download.
+    //   - / \ : and ..  are refused, so a client cannot read files outside the
+    //     shared folder (for example "../secret.txt").
+    //   - a space (or tab) is refused, because every command is split on spaces:
+    //     the name "my file.txt" would arrive as two words and could never be found.
+    static boolean isAllowedName(String name) {
+        if (name.contains("/") || name.contains("\\") || name.contains(":")
+                || name.contains("..")) {
+            return false;
         }
-        Path p = baseDir.resolve(name).normalize();
-        if (!baseDir.equals(p.getParent()) || !Files.isRegularFile(p)) {
-            return null;
-        }
-        return p;
+        return !Pattern.compile("\\s").matcher(name).find();
     }
 
-    private static void log(String msg) {
-        System.out.println("[server] " + msg);
+    // Find a file in the shared folder by its name.
+    // Returns null if the name is not allowed or the file does not exist.
+    private File findFile(String name) {
+        if (!isAllowedName(name)) {
+            return null;
+        }
+        File file = new File(folder, name);
+        if (!file.isFile()) {
+            return null;
+        }
+        return file;
     }
 }

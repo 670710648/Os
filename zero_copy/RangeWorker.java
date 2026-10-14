@@ -1,31 +1,35 @@
-import java.io.EOFException;
+import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.channels.FileChannel;
-import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-import java.util.concurrent.Callable;
+import java.util.Locale;
 
 /**
- * CLIENT side: one worker. It has its OWN connection, its OWN file handle and
- * downloads only its OWN byte range [offset, offset + length), writing it at the
- * same position of the final file. Ranges never overlap, so workers never conflict.
+ * CLIENT side: ONE worker. A worker is a thread that
+ *   - has its OWN connection to the server,
+ *   - downloads only its OWN part of the file: bytes [offset, offset + length),
+ *   - writes that part at the same position in the final file.
+ * The parts of different workers never overlap, so the workers never disturb each other.
  */
-public class RangeWorker implements Callable<Void> {
+public class RangeWorker extends Thread {
 
-    private final int id;
-    private final String host;
-    private final int port;
-    private final String filename;
-    private final Path outFile;
-    private final long offset;
-    private final long length;
-    private final boolean useNio;
-    private final boolean verbose;
+    private int workerId;
+    private String host;
+    private int port;
+    private String filename;
+    private File outFile;
+    private long offset;
+    private long length;
+    private boolean useNio;
+    private boolean verbose;
 
-    public RangeWorker(int id, String host, int port, String filename, Path outFile,
+    // null = the download of this part succeeded, otherwise the error text.
+    // The main thread reads it after join(), so no extra locking is needed.
+    public String error = null;
+
+    public RangeWorker(int workerId, String host, int port, String filename, File outFile,
                        long offset, long length, boolean useNio, boolean verbose) {
-        this.id = id;
+        this.workerId = workerId;
         this.host = host;
         this.port = port;
         this.filename = filename;
@@ -36,64 +40,82 @@ public class RangeWorker implements Callable<Void> {
         this.verbose = verbose;
     }
 
-    @Override
-    public Void call() throws IOException {
-        long t0 = System.nanoTime();
+    // This method runs in the worker's own thread after start() is called.
+    public void run() {
+        long startTime = System.nanoTime();
 
         try (Connection c = new Connection(host, port)) {
-            String mode = useNio ? Protocol.MODE_NIO : Protocol.MODE_IO;
+            // 1) ask the server for our part of the file
+            String mode = Protocol.MODE_IO;
+            if (useNio) {
+                mode = Protocol.MODE_NIO;
+            }
             c.sendLine("GET " + filename + " " + offset + " " + length + " " + mode);
 
-            String reply = c.readReply();                     // "OK <length>"
-            long announced = Long.parseLong(reply.split(" ")[1]);
+            // 2) the server answers "OK <length>" (or "ERROR ...")
+            String reply = c.readReply();
+            String[] words = reply.split(" ");
+            long announced = Long.parseLong(words[1]);
             if (announced != length) {
-                throw new IOException("Server announced " + announced + " bytes, expected " + length);
+                throw new IOException("Server announced " + announced
+                        + " bytes, expected " + length);
             }
 
+            // 3) receive the bytes and write them into the file
             if (useNio) {
                 receiveWithNio(c);
             } else {
                 receiveWithStreams(c);
             }
+        } catch (Exception e) {
+            error = e.toString();
+            return;
         }
 
         if (verbose) {
-            System.out.printf("  worker %2d  offset=%-12d length=%-12d %.0f ms%n",
-                    id, offset, length, (System.nanoTime() - t0) / 1e6);
+            System.out.printf(Locale.ROOT, "  worker %2d  offset=%-12d length=%-12d %.0f ms%n",
+                    workerId, offset, length, (System.nanoTime() - startTime) / 1e6);
         }
-        return null;
     }
 
-    // Traditional I/O: socket -> byte[] (user space) -> RandomAccessFile
+    // Way 1: Traditional I/O
+    // socket -> byte[] in our program -> file
     private void receiveWithStreams(Connection c) throws IOException {
-        try (RandomAccessFile raf = new RandomAccessFile(outFile.toFile(), "rw")) {
-            raf.seek(offset);
+        try (RandomAccessFile raf = new RandomAccessFile(outFile, "rw")) {
+            raf.seek(offset);                                  // jump to our part of the file
             byte[] buffer = new byte[Protocol.BUFFER_SIZE];
-            long remaining = length;
+            long remaining = length;                           // bytes still missing
+
             while (remaining > 0) {
-                int n = c.in.read(buffer, 0, (int) Math.min(buffer.length, remaining));
-                if (n < 0) {
-                    throw new EOFException("Server closed early, " + remaining + " bytes missing");
+                int toRead = (int) Math.min(buffer.length, remaining);
+                int n = c.in.read(buffer, 0, toRead);
+                if (n == -1) {
+                    throw new IOException("Server closed early, " + remaining + " bytes missing");
                 }
                 raf.write(buffer, 0, n);
-                remaining -= n;
+                remaining = remaining - n;
             }
         }
     }
 
-    // NIO native transfer: socket channel -> file channel at a given position
+    // Way 2: NIO native transfer   (socket -> file with FileChannel.transferFrom)
+    // NOTE: on this side it is NOT real "zero copy". When the source is a socket, Java still
+    // reads the socket in small pieces (8 KB) into a temporary buffer and then writes each piece
+    // into the file. That is 8 times more system calls than our 64 KB buffer in way 1, which is
+    // one reason why "nio" is often NOT faster on the client side.
     private void receiveWithNio(Connection c) throws IOException {
-        try (FileChannel fc = FileChannel.open(outFile, StandardOpenOption.WRITE)) {
+        try (FileChannel fileChannel = new RandomAccessFile(outFile, "rw").getChannel()) {
             long position = offset;
             long remaining = length;
+
             while (remaining > 0) {
-                // transferFrom may move fewer bytes than asked, so we must loop
-                long n = fc.transferFrom(c.channel, position, remaining);
-                if (n <= 0) {
-                    throw new EOFException("Server closed early, " + remaining + " bytes missing");
+                // transferFrom may receive LESS than we asked, so we repeat until all arrived
+                long received = fileChannel.transferFrom(c.channel, position, remaining);
+                if (received <= 0) {
+                    throw new IOException("Server closed early, " + remaining + " bytes missing");
                 }
-                position += n;
-                remaining -= n;
+                position = position + received;
+                remaining = remaining - received;
             }
         }
     }

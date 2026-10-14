@@ -22,14 +22,18 @@
     Connection.java     one TCP connection (SocketChannel + streams)
     Downloader.java     whole download job: get size, split into ranges,
                         start the workers, verify size + SHA-256
+    DownloadResult.java a small box holding the result (time, MB/s, verified)
     RangeWorker.java    ONE worker thread: own connection, own range,
                         receives the bytes (io version and nio version)
-    Benchmark.java      runs all test cases and prints the table
+    Benchmark.java      runs all test cases, prints the table, saves
+                        benchmark_results.csv
 
   Tools
-    TestRunner.java     automatic test cases (72 checks): java TestRunner
+    TestRunner.java     automatic test cases (84 checks): java TestRunner
     MakeTestFile.java   creates a big random test file (any OS)
     HOW_TO_RUN.txt      step-by-step guide to compile, test and run
+    testcase.txt        10 test cases to run by hand, with real output
+    Code_Explanation_TH.pdf  Thai PDF: workflow, syntax and every file explained
 
   shared/           the folder the server shares (put test files here)
   README_ENG.txt    this file
@@ -118,17 +122,19 @@ works even when the client and server are on different machines.
 
 5. DESIGN DECISIONS AND WHY
 ---------------------------------------------------------------------
-a) Server concurrency = thread pool (Executors.newCachedThreadPool)
-   The accept loop only accepts. Each connection is given to a pool
-   thread. Reading a file and writing a socket are blocking operations,
-   so "one thread per connection" is the simplest correct model.
-   (Java 21 alternative, one line in Server.java: virtual threads.)
+a) Server concurrency = one thread per connection
+   The accept loop in Server.java only accepts. For every client it
+   creates a ClientHandler (a class that implements Runnable), puts it
+   in a Thread and calls start(). Reading a file and writing a socket are blocking
+   operations, so "one thread per connection" is the simplest correct
+   model. The client side uses the same idea: one RangeWorker (also a
+   Thread) per part of the file.
 
 b) Client writes into ONE final file at the right position
    (no part files, no merge step).
    - The client first calls setLength(size) so the file already has its
      final size.
-   - Each worker opens its OWN RandomAccessFile / FileChannel and writes
+   - Each worker opens its OWN RandomAccessFile (and its channel) and writes
      only inside its own range [offset, offset+length). Ranges never
      overlap, and nobody shares a file position, so there is no race.
    - This is simpler than merging, and does not need extra disk space
@@ -156,7 +162,7 @@ f) Same protocol for both I/O methods
    comparison is fair.
 
 g) Safety checks on the server
-   - File names containing "/", "\" or ".." are rejected (a client
+   - File names containing "/", "\", ":" or ".." are rejected (a client
      cannot read files outside the shared folder).
    - Offset/length are validated (negative values, beyond end of file,
      and integer overflow are all answered with ERROR 416).
@@ -190,9 +196,11 @@ NIO native transfer (mode nio)
    Close heavy programs while measuring.
 2. Start the server once, then run:
        java Client localhost 5000 benchmark test.bin 3
-   It does one warm-up run (not counted) and then runs
-   io/1, io/10, nio/1, nio/10 three times each. Every run is verified
-   with size + SHA-256 (column "verified" must say OK).
+   Every case (io/1, io/10, nio/1, nio/10) is warmed up once (not
+   counted) and then run three times; every run goes into a brand-new
+   file. Every run is verified with size + SHA-256 (column "verified"
+   must say OK). All runs are also saved in benchmark_results.csv
+   (open it with Excel / Google Sheets to make your tables and charts).
 3. Copy the table and the averages into your report. If you want more
    runs, change the last number (e.g. 5).
    Measured time = from starting the workers to all workers finished
@@ -222,7 +230,7 @@ Why NIO may NOT win every time:
 
 Limitations when testing on localhost (write these in the report):
   - Page cache: after the first read the file lives in RAM, so later
-    runs hardly touch the disk. The warm-up run makes this equal for
+    runs hardly touch the disk. The warm-up of every case makes this equal for
     every case, but it means we measure memory speed, not disk speed.
   - Loopback network: no physical network card, no packet loss, almost
     no latency, so results are higher than on a real network.
@@ -237,28 +245,51 @@ Limitations when testing on localhost (write these in the report):
   - HASH command + automatic SHA-256 verification after each download.
   - Optional [io|nio] word in GET so one running server can be tested
     in both modes without restarting.
-  - Built-in benchmark command with warm-up run and averages.
+  - Built-in benchmark command: a warm-up for every case, a new output
+    file for every run, averages, and a CSV file with every run.
   - Per-worker progress lines (offset, length, time) in "download".
   - Path-traversal and range validation on the server.
-  I kept the code simple on purpose (small files, each with one
-  job, no external libraries).
+  - LIST shows only files that a client can really download.
+  - Clear error messages (wrong host name, a typo in the io|nio word,
+    a word where a number is expected, a port out of range).
+  - Numbers are always written with a dot (Locale.ROOT), so the CSV file
+    is correct on a computer with any language setting.
+  I kept the code simple on purpose: small files that each have one
+  job, plain Thread / File / while loops (no thread pools, no lambdas),
+  no external libraries.
 
 
 9. WHAT WAS TESTED
 ---------------------------------------------------------------------
   - LIST / INFO / HASH / GET and all error replies (400, 404, 416).
-  - 64 MB file downloaded with 1 and 10 workers in both io and nio
-    mode: SHA-256 identical to the original every time.
-  - A 21-byte file with 10 workers (file smaller than 10 parts).
+  - 7 file sizes (0, 1, 9, 10 bytes, 1000003 bytes, about 5 MB and 8 MB)
+    downloaded with 1, 3 and 10 workers in both io and nio mode:
+    SHA-256 identical to the original every time (java TestRunner).
+  - A 100 MB file with 1 and 10 workers in io and nio mode, and the
+    benchmark (the 10 hand-run cases are in testcase.txt).
   - 4 clients (= 40 connections) downloading at the same time.
-  You can repeat all of this yourself: java TestRunner (72 checks).
+  - By hand (not part of TestRunner): a 2.5 GB file, which is bigger than
+    2^31 bytes, with 10 workers in io and nio mode: the SHA-256 is the same
+    as the one from an independent tool. The server also kept running
+    and kept answering when it ran out of open files (ulimit -n 64).
+  You can repeat all of this yourself: java TestRunner (84 checks).
   See HOW_TO_RUN.txt for the full step-by-step guide.
 
 
 10. KNOWN LIMITATIONS
 ---------------------------------------------------------------------
-  - File names with spaces are not supported (the protocol splits on
-    spaces).
+  - File names with spaces (or ":" or "..") are not supported: the
+    protocol splits on spaces. The server does not show them in LIST.
+  - Timeouts: the SERVER closes a connection that sends no command for 60
+    seconds. The CLIENT has no timeout: if a server accepts the connection
+    and then never answers, the client waits for ever. A client that sends
+    GET and then never reads can still keep one server thread busy. The
+    server uses one thread per connection with no upper limit (fine for
+    this assignment, not for a real server).
+  - The server listens on all network interfaces (everyone in the same
+    network can download the shared folder).
+  - HASH is calculated again on every request (a 1 GB file takes a few
+    seconds); this is not part of the measured time.
   - No authentication or encryption (not required by the assignment).
   - There is no retry or resume: if one worker fails, the download
     reports an error and stops.
