@@ -3,15 +3,23 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * The SERVER: main program.
- * It only waits for clients. For every client that connects, it creates a new thread
- * (a ClientHandler) that talks to that client, so many clients are served at the same time.
+ * It only waits for clients. Every client that connects is given to a THREAD POOL
+ * (a fixed group of threads that are created once and re-used). A free thread runs a
+ * ClientHandler that talks to that client, so many clients are served at the same time.
+ * If all threads are busy, the new client waits in the pool's queue until one is free.
  *
  * Run:  java Server [port] [folder]        (default: port 5000, folder "shared")
  */
 public class Server {
+
+    // The most connections that are served at the same time.
+    // A client with 10 workers uses 10 of them, so 100 is enough for several clients.
+    static final int POOL_SIZE = 100;
 
     public static void main(String[] args) throws IOException {
         // 1) read the settings from the command line (or use the defaults)
@@ -51,7 +59,8 @@ public class Server {
         }
         System.out.println("[server] listening on port " + port + ", sharing folder: " + folder);
 
-        // 3) loop forever: accept a client, give it its own thread
+        // 3) loop forever: accept a client and give it to the thread pool
+        ExecutorService pool = Executors.newFixedThreadPool(POOL_SIZE);
         while (true) {
             SocketChannel client = null;
             try {
@@ -63,9 +72,7 @@ public class Server {
                 pause(100);
                 continue;
             }
-            ClientHandler handler = new ClientHandler(client, folder);
-            Thread thread = new Thread(handler);
-            thread.start();                                  // handler.run() now runs in parallel
+            pool.execute(new ClientHandler(client, folder));  // a free pool thread runs handler.run()
         }
     }
 

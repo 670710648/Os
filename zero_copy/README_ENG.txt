@@ -122,12 +122,14 @@ works even when the client and server are on different machines.
 
 5. DESIGN DECISIONS AND WHY
 ---------------------------------------------------------------------
-a) Server concurrency = one thread per connection
+a) Server concurrency = a fixed THREAD POOL (100 threads)
    The accept loop in Server.java only accepts. For every client it
-   creates a ClientHandler (a class that implements Runnable), puts it
-   in a Thread and calls start(). Reading a file and writing a socket are blocking
-   operations, so "one thread per connection" is the simplest correct
-   model. The client side uses the same idea: one RangeWorker (also a
+   creates a ClientHandler (a class that implements Runnable) and gives it
+   to an ExecutorService made by Executors.newFixedThreadPool(100)
+   (pool.execute(...)). The 100 threads are created once and re-used; if all
+   are busy, a new client waits in the queue. Reading a file and writing a
+   socket are blocking operations, so "one connection = one busy pool thread"
+   is a simple correct model. The client side uses the same idea: one RangeWorker (also a
    Thread) per part of the file.
 
 b) Client writes into ONE final file at the right position
@@ -284,8 +286,9 @@ Limitations when testing on localhost (write these in the report):
     seconds. The CLIENT has no timeout: if a server accepts the connection
     and then never answers, the client waits for ever. A client that sends
     GET and then never reads can still keep one server thread busy. The
-    server uses one thread per connection with no upper limit (fine for
-    this assignment, not for a real server).
+    server uses a pool of 100 threads, so at most 100 connections are served at
+    once; a client that holds connections open without reading can use them up
+    (fine for this assignment, not for a real server).
   - The server listens on all network interfaces (everyone in the same
     network can download the shared folder).
   - HASH is calculated again on every request (a 1 GB file takes a few

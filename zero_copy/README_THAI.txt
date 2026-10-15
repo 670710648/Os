@@ -124,12 +124,13 @@ HASH เป็นคำสั่งที่เพิ่มเอง (ไม่�
 
 5. การตัดสินใจในการออกแบบ และเหตุผล
 ---------------------------------------------------------------------
-ก) Server รองรับหลาย connection = 1 connection ต่อ 1 thread
+ก) Server รองรับหลาย connection = Thread Pool ขนาดคงที่ (100 thread)
    Loop หลักใน Server.java ทำหน้าที่ accept อย่างเดียว พอมี client เข้ามา
-   ก็สร้าง ClientHandler (คลาสที่ implements Runnable) ใส่ใน Thread
-   แล้วเรียก start()
-   การอ่านไฟล์และเขียน socket เป็น blocking operation ดังนั้นโมเดล
-   "1 connection ต่อ 1 thread" จึงง่ายและถูกต้องที่สุด
+   ก็สร้าง ClientHandler (คลาสที่ implements Runnable) แล้วส่งให้
+   ExecutorService ที่สร้างจาก Executors.newFixedThreadPool(100)
+   (pool.execute(...)) thread 100 ตัวถูกสร้างครั้งเดียวแล้วใช้ซ้ำ ถ้าทุกตัว
+   ไม่ว่าง client ใหม่จะรอในคิว การอ่านไฟล์และเขียน socket เป็น blocking
+   operation ดังนั้นโมเดล "1 connection ใช้ 1 thread ของ pool" จึงง่ายและถูกต้อง
    ฝั่ง client ใช้แนวคิดเดียวกัน: RangeWorker (เป็น Thread เหมือนกัน)
    1 ตัวต่อไฟล์ 1 ช่วง
 
@@ -280,8 +281,9 @@ NIO native transfer (mode nio)
   - Timeout: ฝั่ง SERVER จะปิด connection ที่ไม่ส่งคำสั่งมานาน 60 วินาที
     แต่ฝั่ง CLIENT ไม่มี timeout: ถ้า server รับ connection แล้วไม่ตอบ
     client จะรอไปเรื่อย ๆ และ client ที่ส่ง GET แล้วไม่อ่านข้อมูลก็ยังทำให้
-    thread ของ server ค้างได้ server ใช้ 1 thread ต่อ 1 connection
-    โดยไม่จำกัดจำนวน (พอสำหรับโจทย์นี้ แต่ไม่เหมาะกับ server จริง)
+    thread ของ server ค้างได้ server ใช้ thread pool 100 ตัว จึงรับได้พร้อมกันไม่เกิน 100 connection
+    client ที่ถือ connection ค้างโดยไม่อ่านอาจใช้ thread หมด
+    (พอสำหรับโจทย์นี้ แต่ไม่เหมาะกับ server จริง)
   - server เปิดรับทุกเครือข่าย (ทุกคนในเครือข่ายเดียวกันโหลดไฟล์ใน
     โฟลเดอร์ที่แชร์ได้)
   - HASH คำนวณใหม่ทุกครั้งที่ขอ (ไฟล์ 1 GB ใช้เวลาไม่กี่วินาที)
